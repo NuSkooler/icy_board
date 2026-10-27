@@ -42,7 +42,12 @@ pub struct Sz {
     can_count: usize,
     receiver_capabilities: u8,
     nonstop: bool,
+    noise: usize,
 }
+
+/// Bytes skipped as noise before a header (status text the receiving
+/// program writes into the same pty) before they count as header errors.
+const MAX_NOISE: usize = 16 * 1024;
 
 impl Sz {
     pub fn new(block_length: usize) -> Self {
@@ -58,6 +63,7 @@ impl Sz {
             can_count: 0,
             package_len: block_length,
             nonstop: true,
+            noise: 0,
         }
     }
 
@@ -288,6 +294,13 @@ impl Sz {
                     // Header, not as a header error: otherwise the error budget
                     // would abort before the fifth consecutive CAN is seen.
                     Some(ZModemError::ZPADExected(0x11 | 0x91 | 0x13 | 0x93 | 0x18)) => return Ok(None),
+                    // Anything else before a ZPAD is noise between frames (such as the
+                    // receiver's status text on a pty): skip it, as receivers skip
+                    // garbage, within a bound.
+                    Some(ZModemError::ZPADExected(_)) if self.noise < MAX_NOISE => {
+                        self.noise += 1;
+                        return Ok(None);
+                    }
                     Some(
                         ZModemError::ZPADExected(_)
                         | ZModemError::ZLDEExected(_)
@@ -316,6 +329,7 @@ impl Sz {
             Ok(header) => {
                 if header.is_some() {
                     self.errors = 0;
+                    self.noise = 0;
                 }
                 Ok(header)
             }
@@ -325,7 +339,7 @@ impl Sz {
     /// Handshakes already wait for a response. Skip boundary flow control and
     /// stale ZRINIT there too, but bound the amount of noise consumed per call.
     async fn read_handshake_header(&mut self, com: &mut dyn Connection, transfer_state: &mut TransferState) -> crate::Result<Option<Header>> {
-        for _ in 0..32 {
+        for _ in 0..(32 + MAX_NOISE) {
             let result = Header::read(com, &mut self.can_count).await;
             if let Some(header) = self.process_header_read(com, transfer_state, result).await? {
                 if header.frame_type != ZFrameType::RIinit {
